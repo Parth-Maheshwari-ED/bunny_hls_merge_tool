@@ -1,0 +1,6 @@
+.env
+.DS_Store
+.venv/
+output_zip/
+output_hls/
+drm_migration_output/
