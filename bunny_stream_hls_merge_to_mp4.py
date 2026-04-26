@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -331,6 +332,27 @@ async def _attempt_zip_to_mp4(
 # ---------------------------------------------------------------------------
 # FFmpeg: single-input HLS remux (clear or AES-128)
 # ---------------------------------------------------------------------------
+@functools.lru_cache(maxsize=1)
+def _ffmpeg_hls_demuxer_has_extension_picky() -> bool:
+    """
+    True if this ffmpeg's HLS demuxer documents ``-extension_picky`` (newer FFmpeg).
+
+    Stock builds on some distros (e.g. older Amazon Linux) omit it; passing the flag
+    then fails with "Unrecognized option 'extension_picky'".
+    """
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-h", "demuxer=hls"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        blob = (proc.stdout or "") + (proc.stderr or "")
+        return "-extension_picky" in blob
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return False
+
+
 def ffmpeg_hls_remux_to_mp4(variant_playlist_url: str, output_mp4: Path) -> None:
     """
     Remux HLS (clear or AES-128) to MP4 in one ffmpeg pass.
@@ -345,19 +367,23 @@ def ffmpeg_hls_remux_to_mp4(variant_playlist_url: str, output_mp4: Path) -> None
         "-loglevel",
         "error",
         "-y",
-        "-extension_picky",
-        "0",
-        "-allowed_segment_extensions",
-        "ALL",
-        "-allowed_extensions",
-        "ALL",
-        "-i",
-        variant_playlist_url,
-        "-c",
-        "copy",
-        "-movflags",
-        "+faststart",
     ]
+    if _ffmpeg_hls_demuxer_has_extension_picky():
+        head.extend(["-extension_picky", "0"])
+    head.extend(
+        [
+            "-allowed_segment_extensions",
+            "ALL",
+            "-allowed_extensions",
+            "ALL",
+            "-i",
+            variant_playlist_url,
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+        ]
+    )
     cmd_aac = head + ["-bsf:a", "aac_adtstoasc", str(output_mp4)]
     LOG.info("Running ffmpeg HLS remux: %s", " ".join(cmd_aac))
     LOG.info(
