@@ -500,6 +500,26 @@ def rewrite_hls_media_playlist_signed_query(playlist_url_with_query: str, body: 
     return "\n".join(out_lines) + trailing
 
 
+def hls_variant_url_or_local_playlist_for_ffmpeg(
+    variant_url: str, variant_text: str, staging_dir: Path
+) -> str:
+    """
+    Return the string to pass as ffmpeg's ``-i`` input for an HLS **media** variant.
+
+    When ``variant_url`` has a query string (e.g. Bunny Storage ``accessKey``), ffmpeg
+    does not apply it to relative segment lines, so segment GETs fail (often exit 183).
+    In that case we write ``rewrite_hls_media_playlist_signed_query(...)`` under
+    ``staging_dir`` and return that file path; otherwise return ``variant_url`` unchanged.
+    """
+    if not urlparse(variant_url.strip()).query.strip():
+        return variant_url.strip()
+    body = rewrite_hls_media_playlist_signed_query(variant_url, variant_text)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    local = staging_dir / "variant_ffmpeg.m3u8"
+    local.write_text(body, encoding="utf-8")
+    return str(local.resolve())
+
+
 def pick_best_variant_url(master_text: str, master_url: str) -> str:
     """
     From a master playlist, choose the variant with highest BANDWIDTH
@@ -870,7 +890,15 @@ async def process_one_video(
                 len(segment_urls),
                 has_key,
             )
-            ffmpeg_hls_remux_to_mp4(variant_url, out_path)
+            staging = work_dir if work_dir is not None else out_path.parent
+            ffmpeg_in = hls_variant_url_or_local_playlist_for_ffmpeg(
+                variant_url, variant_text, staging
+            )
+            try:
+                ffmpeg_hls_remux_to_mp4(ffmpeg_in, out_path)
+            finally:
+                if ffmpeg_in != variant_url:
+                    Path(ffmpeg_in).unlink(missing_ok=True)
             LOG.info("Wrote %s (via HLS)", out_path)
             return out_path
     finally:

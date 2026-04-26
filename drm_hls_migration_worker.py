@@ -454,14 +454,26 @@ async def _merge_hls_master_to_mp4(
     session: aiohttp.ClientSession,
     master_url: str,
     out_mp4: Path,
+    work_dir: Path,
     timeout: aiohttp.ClientTimeout,
 ) -> None:
     async with session.get(master_url, allow_redirects=True, timeout=timeout) as resp:
         resp.raise_for_status()
         master_text = await resp.text()
     variant_url = bunny.pick_best_variant_url(master_text, master_url)
+    async with session.get(variant_url, allow_redirects=True, timeout=timeout) as resp:
+        resp.raise_for_status()
+        variant_text = await resp.text()
+    ffmpeg_in = bunny.hls_variant_url_or_local_playlist_for_ffmpeg(
+        variant_url, variant_text, work_dir
+    )
+    if ffmpeg_in.rstrip("/") != variant_url.strip().rstrip("/"):
+        LOG.info(
+            "HLS signed variant: using rewritten local playlist for ffmpeg (-i %s)",
+            ffmpeg_in,
+        )
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, bunny.ffmpeg_hls_remux_to_mp4, variant_url, out_mp4)
+    await loop.run_in_executor(None, bunny.ffmpeg_hls_remux_to_mp4, ffmpeg_in, out_mp4)
 
 
 async def _report_safe(
@@ -526,7 +538,7 @@ async def _process_migration_job(
                 else master_url
             )
             LOG.info("HLS master: %s", redacted)
-            await _merge_hls_master_to_mp4(session, master_url, out_mp4, timeout)
+            await _merge_hls_master_to_mp4(session, master_url, out_mp4, work_dir, timeout)
     except Exception as exc:
         LOG.exception("Merge failed migration_id=%s", migration_id)
         err = f"merge failed: {exc}"
