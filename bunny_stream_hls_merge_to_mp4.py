@@ -333,13 +333,8 @@ async def _attempt_zip_to_mp4(
 # FFmpeg: single-input HLS remux (clear or AES-128)
 # ---------------------------------------------------------------------------
 @functools.lru_cache(maxsize=1)
-def _ffmpeg_hls_demuxer_has_extension_picky() -> bool:
-    """
-    True if this ffmpeg's HLS demuxer documents ``-extension_picky`` (newer FFmpeg).
-
-    Stock builds on some distros (e.g. older Amazon Linux) omit it; passing the flag
-    then fails with "Unrecognized option 'extension_picky'".
-    """
+def _ffmpeg_hls_demuxer_help_text() -> str:
+    """Raw stdout+stderr from ``ffmpeg -h demuxer=hls`` (empty if probe failed)."""
     try:
         proc = subprocess.run(
             ["ffmpeg", "-h", "demuxer=hls"],
@@ -347,18 +342,37 @@ def _ffmpeg_hls_demuxer_has_extension_picky() -> bool:
             text=True,
             timeout=15,
         )
-        blob = (proc.stdout or "") + (proc.stderr or "")
-        return "-extension_picky" in blob
+        return (proc.stdout or "") + (proc.stderr or "")
     except (OSError, subprocess.TimeoutExpired, ValueError):
-        return False
+        return ""
+
+
+def _ffmpeg_hls_relaxed_extension_args() -> List[str]:
+    """
+    HLS demuxer flags that relax segment filename extensions (e.g. Bunny ``.dts``).
+
+    Each flag exists only from a certain FFmpeg version onward. Passing an unsupported
+    global-style option makes ffmpeg exit with "Unrecognized option '…'", so we only
+    append options that appear in this host's ``ffmpeg -h demuxer=hls`` output.
+    """
+    blob = _ffmpeg_hls_demuxer_help_text()
+    out: List[str] = []
+    if "-extension_picky" in blob:
+        out.extend(["-extension_picky", "0"])
+    if "-allowed_segment_extensions" in blob:
+        out.extend(["-allowed_segment_extensions", "ALL"])
+    if "-allowed_extensions" in blob:
+        out.extend(["-allowed_extensions", "ALL"])
+    return out
 
 
 def ffmpeg_hls_remux_to_mp4(variant_playlist_url: str, output_mp4: Path) -> None:
     """
     Remux HLS (clear or AES-128) to MP4 in one ffmpeg pass.
 
-    Bunny Stream sometimes lists TS segments as ``*.dts``; stock ffmpeg rejects
-    those unless extension checks are relaxed.
+    Bunny Stream sometimes lists TS segments as ``*.dts``; newer ffmpeg can relax
+    extension checks via HLS demuxer options. Older binaries omit those options; we
+    probe once and only pass flags this build actually supports.
     """
     output_mp4.parent.mkdir(parents=True, exist_ok=True)
     head = [
@@ -368,14 +382,9 @@ def ffmpeg_hls_remux_to_mp4(variant_playlist_url: str, output_mp4: Path) -> None
         "error",
         "-y",
     ]
-    if _ffmpeg_hls_demuxer_has_extension_picky():
-        head.extend(["-extension_picky", "0"])
+    head.extend(_ffmpeg_hls_relaxed_extension_args())
     head.extend(
         [
-            "-allowed_segment_extensions",
-            "ALL",
-            "-allowed_extensions",
-            "ALL",
             "-i",
             variant_playlist_url,
             "-c",
