@@ -32,6 +32,20 @@ then **POST …/worker/next** again (after a short pause, default **1.5s**, befo
 call except the first). Merge, S3, or report errors on one migration do **not**
 stop the worker; only ``worker/next`` transport or envelope errors exit the process.
 Unexpected crashes are still **reported** as ``failure`` when ``migration_id`` is known.
+
+**Throughput (why one EC2 does not “use 50 Gbps”)**
+
+- This process does **one** ``worker/next`` job at a time, then merge, then S3, then ``worker/report``.
+  Throughput is the sum of **Bunny → EC2** (ZIP or HLS), **ffmpeg**, and **EC2 → S3**, plus **Edmingle** round-trips.
+  Your instance’s “up to N Gbps” NIC does not apply to Bunny’s edge build/ZIP speed or to single-stream ffmpeg.
+- **ZIP:** Bunny builds and streams the archive; downloads in your logs are often **~10–15 MiB/s** — that is
+  usually **Bunny or the path to Bunny**, not a broken EC2 NIC.
+- **HLS:** ffmpeg pulls segments **sequentially**; wall time is dominated by remux + network, not local RAM.
+- **Idle gap:** ``DRM_MIGRATION_JOB_GAP_SEC`` (default ``1.5``) sleeps between jobs; set to ``0`` if the API tolerates it.
+- **Scale out:** run **multiple** worker processes on **separate** hosts (or one host if Edmingle hands out distinct
+  migration rows per worker without locking); one Python loop will never saturate “50 Gbps”.
+- **Tuning:** ``DRM_MIGRATION_ZIP_READ_CHUNK_BYTES``, ``DRM_MIGRATION_S3_UPLOAD_MAX_CONCURRENCY``,
+  ``DRM_MIGRATION_S3_MULTIPART_CHUNKSIZE_BYTES`` (see ``bunny_stream_hls_merge_to_mp4`` / ``_drm_migration_s3``).
 """
 
 from __future__ import annotations

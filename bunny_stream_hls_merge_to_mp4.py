@@ -76,6 +76,23 @@ VIDEO_SOURCE_EXTENSIONS = frozenset({".mp4", ".ts", ".m4s"})
 ZIP_PROGRESS_LOG_BYTES = 50 * 1024 * 1024
 
 
+def _zip_download_read_chunk_bytes() -> int:
+    """
+    aiohttp read size for Storage ZIP streaming (fewer iterations when larger).
+
+    Override with ``DRM_MIGRATION_ZIP_READ_CHUNK_BYTES`` (bytes), clamped to 64 KiB–64 MiB.
+    """
+    raw = (os.environ.get("DRM_MIGRATION_ZIP_READ_CHUNK_BYTES") or "").strip()
+    default = 4 * 1024 * 1024
+    if not raw:
+        return default
+    try:
+        n = int(raw)
+    except ValueError:
+        return default
+    return max(64 * 1024, min(n, 64 * 1024 * 1024))
+
+
 def parse_storage_zone_from_cdn_base(cdn_base: str) -> Optional[str]:
     """
     Derive Bunny storage / pull zone label from Stream CDN host, e.g.
@@ -134,7 +151,7 @@ def find_best_video_file_in_tree(root: Path) -> Optional[Path]:
 
 
 def extract_zip_logged(zip_path: Path, dest_dir: Path) -> int:
-    """Extract ZIP to ``dest_dir``; return member count. Raises on corrupt archive."""
+    """Extract **entire** ZIP to ``dest_dir``; return member count. Prefer :func:`extract_best_video_zip_logged` for Storage folder ZIPs (saves disk)."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "r") as zf:
         names = zf.namelist()
@@ -149,6 +166,69 @@ def extract_zip_logged(zip_path: Path, dest_dir: Path) -> int:
         elapsed = time.perf_counter() - t0
         LOG.info("Extraction finished in %.2fs", elapsed)
     return len(names)
+
+
+def _pick_best_zip_video_zipinfo(zf: zipfile.ZipFile) -> Optional[zipfile.ZipInfo]:
+    """Best ``.mp4`` / ``.ts`` / ``.m4s`` member by resolution path hint then uncompressed size."""
+    scored: list[tuple[int, int, zipfile.ZipInfo]] = []
+    for info in zf.infolist():
+        fn = (info.filename or "").replace("\\", "/")
+        if fn.endswith("/"):
+            continue
+        ext = Path(fn).suffix.lower()
+        if ext not in VIDEO_SOURCE_EXTENSIONS:
+            continue
+        h = _height_hint_from_relative_path(fn)
+        scored.append((h, int(info.file_size), info))
+    if not scored:
+        return None
+    scored.sort(key=lambda t: (t[0], t[1]))
+    h, sz, best = scored[-1]
+    LOG.info(
+        "Selected ZIP member to extract: %s (hint_h=%s, uncompressed_size=%s bytes)",
+        best.filename,
+        h,
+        sz,
+    )
+    return best
+
+
+def _safe_extract_zip_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, dest_dir: Path) -> None:
+    """Extract one member; reject path traversal."""
+    root = dest_dir.resolve()
+    target = (root / info.filename).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError(f"ZIP path traversal in member {info.filename!r}") from exc
+    zf.extract(info, path=dest_dir)
+
+
+def extract_best_video_zip_logged(zip_path: Path, dest_dir: Path) -> None:
+    """
+    Extract only the single best video member (same scoring as :func:`find_best_video_file_in_tree`).
+
+    Bunny folder ZIPs can contain hundreds of renditions; ``extractall`` doubles disk use
+    (archive + full tree) and often exhausts small ``/tmp`` volumes. One file is enough for
+    stream-copy remux to MP4.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        names = zf.namelist()
+        if not names:
+            raise zipfile.BadZipFile("ZIP archive has no entries")
+        best = _pick_best_zip_video_zipinfo(zf)
+        if best is None:
+            raise RuntimeError("No .mp4, .ts, or .m4s members in ZIP archive")
+        n_total = len(zf.infolist())
+        LOG.info(
+            "Extracting 1 of %s ZIP entries -> %s (avoids full extractall disk peak)",
+            n_total,
+            dest_dir,
+        )
+        t0 = time.perf_counter()
+        _safe_extract_zip_member(zf, best, dest_dir)
+        LOG.info("Extraction finished in %.2fs", time.perf_counter() - t0)
 
 
 def ffmpeg_container_stream_copy_to_mp4(input_path: Path, output_mp4: Path) -> None:
@@ -223,7 +303,7 @@ async def download_video_as_zip(
     async def _stream_body_to_file(resp: aiohttp.ClientResponse, dest: Path) -> int:
         total = 0
         last_log = 0
-        chunk_size = 1024 * 1024
+        chunk_size = _zip_download_read_chunk_bytes()
         with open(dest, "wb") as out_f:
             while True:
                 chunk = await resp.content.read(chunk_size)
@@ -316,7 +396,7 @@ async def _attempt_zip_to_mp4(
     if not zipfile.is_zipfile(zip_path):
         raise RuntimeError("Downloaded file is not a valid ZIP archive")
     extract_dir = work_dir / "extracted"
-    extract_zip_logged(zip_path, extract_dir)
+    extract_best_video_zip_logged(zip_path, extract_dir)
     try:
         n_zip = zip_path.stat().st_size
         zip_path.unlink()

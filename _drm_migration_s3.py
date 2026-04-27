@@ -92,6 +92,36 @@ def head_object_nonzero_size(client: Any, bucket: str, key: str) -> bool:
     return size > 0
 
 
+def _s3_upload_transfer_config() -> Any:
+    """
+    Optional multipart tuning (larger MP4s). Env:
+    ``DRM_MIGRATION_S3_UPLOAD_MAX_CONCURRENCY`` (default 16, max 32),
+    ``DRM_MIGRATION_S3_MULTIPART_CHUNKSIZE_BYTES`` (default 16 MiB, max 256 MiB).
+    """
+    try:
+        from boto3.s3.transfer import TransferConfig
+    except ImportError:  # pragma: no cover
+        return None
+    try:
+        conc = int((os.environ.get("DRM_MIGRATION_S3_UPLOAD_MAX_CONCURRENCY") or "16").strip())
+    except ValueError:
+        conc = 16
+    try:
+        chunk = int(
+            (os.environ.get("DRM_MIGRATION_S3_MULTIPART_CHUNKSIZE_BYTES") or str(16 * 1024 * 1024)).strip()
+        )
+    except ValueError:
+        chunk = 16 * 1024 * 1024
+    conc = max(1, min(conc, 32))
+    chunk = max(5 * 1024 * 1024, min(chunk, 256 * 1024 * 1024))
+    return TransferConfig(
+        multipart_threshold=8 * 1024 * 1024,
+        multipart_chunksize=chunk,
+        max_concurrency=conc,
+        use_threads=True,
+    )
+
+
 def put_mp4_private_then_retry_no_acl(client: Any, bucket: str, key: str, local_path: Path) -> None:
     """
     PutObject stream copy from disk; ``Content-Type: video/mp4``.
@@ -100,15 +130,19 @@ def put_mp4_private_then_retry_no_acl(client: Any, bucket: str, key: str, local_
     path = str(local_path.resolve())
     extra_with_acl = {"ContentType": "video/mp4", "ACL": "private"}
     extra_plain = {"ContentType": "video/mp4"}
+    xfer = _s3_upload_transfer_config()
+    xfer_kw: dict[str, Any] = {}
+    if xfer is not None:
+        xfer_kw["Config"] = xfer
     try:
-        client.upload_file(path, bucket, key, ExtraArgs=extra_with_acl)
+        client.upload_file(path, bucket, key, ExtraArgs=extra_with_acl, **xfer_kw)
         LOG.debug("PutObject succeeded with ACL private: s3://%s/%s", bucket, key)
         return
     except Exception as exc:  # pylint: disable=broad-exception-caught
         low = str(exc).lower()
         if "acl" in low or "access control" in low or "cannedacl" in low or "not supported" in low:
             LOG.warning("PutObject with ACL private failed (%s); retrying without ACL", exc)
-            client.upload_file(path, bucket, key, ExtraArgs=extra_plain)
+            client.upload_file(path, bucket, key, ExtraArgs=extra_plain, **xfer_kw)
             LOG.info("PutObject succeeded without ACL: s3://%s/%s", bucket, key)
             return
         raise
