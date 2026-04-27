@@ -61,7 +61,17 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import quote
 
-import aiohttp
+try:
+    import aiohttp
+except ModuleNotFoundError as exc:  # pragma: no cover
+    print(
+        "Missing dependency aiohttp. From the repo root either:\n"
+        "  source .venv/bin/activate && python3 drm_hls_migration_worker.py\n"
+        "  ./.venv/bin/python3 drm_hls_migration_worker.py\n"
+        "Or install once: python3 -m pip install --user 'aiohttp>=3.9' 'boto3>=1.34'",
+        file=sys.stderr,
+    )
+    raise SystemExit(2) from exc
 
 import bunny_stream_hls_merge_to_mp4 as bunny
 from _drm_migration_s3 import (
