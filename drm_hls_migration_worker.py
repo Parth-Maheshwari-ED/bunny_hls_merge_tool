@@ -516,6 +516,10 @@ async def _process_migration_job(
     Returns True only if S3 upload succeeded and ``worker/report`` returned 200.
     On any failure, sends ``worker/report`` with ``outcome=failure`` and ``error_message``,
     then returns False.
+
+    The per-job ``work_dir`` under the system temp directory is always removed in a
+    ``finally`` block (merge/HLS/S3/report failures, success, and interrupt) so ZIPs,
+    extracted trees, local HLS playlists, and ``merged.mp4`` do not accumulate on disk.
     """
     migration_id = _migration_id(job)
     LOG.info("Picked migration_id=%s", migration_id)
@@ -528,131 +532,130 @@ async def _process_migration_job(
     out_mp4 = work_dir / "merged.mp4"
 
     try:
-        if merge_method == "zip":
-            await _merge_zip_job_to_mp4(session, job, work_dir, out_mp4, timeout)
-        else:
-            master_url = _resolve_hls_master_url(job)
-            redacted = (
-                master_url.split("?", 1)[0] + "?accessKey=***"
-                if "?" in master_url
-                else master_url
+        try:
+            if merge_method == "zip":
+                await _merge_zip_job_to_mp4(session, job, work_dir, out_mp4, timeout)
+            else:
+                master_url = _resolve_hls_master_url(job)
+                redacted = (
+                    master_url.split("?", 1)[0] + "?accessKey=***"
+                    if "?" in master_url
+                    else master_url
+                )
+                LOG.info("HLS master: %s", redacted)
+                await _merge_hls_master_to_mp4(session, master_url, out_mp4, work_dir, timeout)
+        except Exception as exc:
+            LOG.exception("Merge failed migration_id=%s", migration_id)
+            err = f"merge failed: {exc}"
+            low = str(exc).lower()
+            if "401" in str(exc) or "unauthorized" in low:
+                err += (
+                    " — Bunny/Storage authorization failed: check bunny.drm_bunny_access_key "
+                    "and paths from worker/next (wrong API data yields 401 on playlist or segments)."
+                )
+            if "errno 28" in low or "no space left on device" in low:
+                err += " — Disk full under temp (often /tmp): free space, enlarge volume, or set TMPDIR to a larger mount."
+            await _report_safe(
+                session,
+                migration_id=migration_id,
+                outcome="failure",
+                error_message=err,
+                timeout=timeout,
             )
-            LOG.info("HLS master: %s", redacted)
-            await _merge_hls_master_to_mp4(session, master_url, out_mp4, work_dir, timeout)
-    except Exception as exc:
-        LOG.exception("Merge failed migration_id=%s", migration_id)
-        err = f"merge failed: {exc}"
-        low = str(exc).lower()
-        if "401" in str(exc) or "unauthorized" in low:
-            err += (
-                " — Bunny/Storage authorization failed: check bunny.drm_bunny_access_key "
-                "and paths from worker/next (wrong API data yields 401 on playlist or segments)."
+            return False
+
+        if not out_mp4.is_file() or out_mp4.stat().st_size <= 0:
+            await _report_safe(
+                session,
+                migration_id=migration_id,
+                outcome="failure",
+                error_message="merge produced empty MP4",
+                timeout=timeout,
             )
-        await _report_safe(
-            session,
-            migration_id=migration_id,
-            outcome="failure",
-            error_message=err,
-            timeout=timeout,
-        )
-        shutil.rmtree(work_dir, ignore_errors=True)
-        return False
+            return False
 
-    if not out_mp4.is_file() or out_mp4.stat().st_size <= 0:
-        await _report_safe(
-            session,
-            migration_id=migration_id,
-            outcome="failure",
-            error_message="merge produced empty MP4",
-            timeout=timeout,
-        )
-        shutil.rmtree(work_dir, ignore_errors=True)
-        return False
+        try:
+            bucket, region, object_key = _s3_from_job(job)
+        except Exception as exc:
+            await _report_safe(
+                session,
+                migration_id=migration_id,
+                outcome="failure",
+                error_message=str(exc),
+                timeout=timeout,
+            )
+            return False
 
-    try:
-        bucket, region, object_key = _s3_from_job(job)
-    except Exception as exc:
-        await _report_safe(
-            session,
-            migration_id=migration_id,
-            outcome="failure",
-            error_message=str(exc),
-            timeout=timeout,
-        )
-        shutil.rmtree(work_dir, ignore_errors=True)
-        return False
+        creds = _s3_credentials_from_env()
+        if creds is None:
+            local_out.mkdir(parents=True, exist_ok=True)
+            dest = local_out / f"{migration_id}_merged.mp4"
+            shutil.move(str(out_mp4), str(dest))
+            msg = (
+                "LOCAL_OUTPUT_NO_S3: drm_migration_s3_access_key / drm_migration_s3_secret_key "
+                f"not set; MP4 saved at {dest}"
+            )
+            LOG.warning(msg)
+            await _report_safe(
+                session,
+                migration_id=migration_id,
+                outcome="failure",
+                error_message=msg,
+                timeout=timeout,
+            )
+            return False
 
-    creds = _s3_credentials_from_env()
-    if creds is None:
-        local_out.mkdir(parents=True, exist_ok=True)
-        dest = local_out / f"{migration_id}_merged.mp4"
-        shutil.move(str(out_mp4), str(dest))
-        msg = (
-            "LOCAL_OUTPUT_NO_S3: drm_migration_s3_access_key / drm_migration_s3_secret_key "
-            f"not set; MP4 saved at {dest}"
-        )
-        LOG.warning(msg)
-        await _report_safe(
-            session,
-            migration_id=migration_id,
-            outcome="failure",
-            error_message=msg,
-            timeout=timeout,
-        )
-        shutil.rmtree(work_dir, ignore_errors=True)
-        return False
+        ak, sk = creds
+        client = drm_s3_client_from_keys(region, ak, sk)
+        try:
+            if head_object_nonzero_size(client, bucket, object_key):
+                LOG.info("S3 object already present: s3://%s/%s", bucket, object_key)
+            else:
+                put_mp4_private_then_retry_no_acl(client, bucket, object_key, out_mp4)
+                verify_object_nonzero_after_put(client, bucket, object_key)
+                LOG.info("Uploaded s3://%s/%s", bucket, object_key)
+        except Exception as exc:
+            LOG.exception("S3 failed migration_id=%s", migration_id)
+            if is_s3_auth_or_config_failure(exc):
+                msg = f"S3 authentication or configuration failure: {exc}"
+            else:
+                msg = f"S3 upload/verify failed: {exc}"
+            await _report_safe(
+                session,
+                migration_id=migration_id,
+                outcome="failure",
+                error_message=msg,
+                timeout=timeout,
+            )
+            return False
 
-    ak, sk = creds
-    client = drm_s3_client_from_keys(region, ak, sk)
-    try:
-        if head_object_nonzero_size(client, bucket, object_key):
-            LOG.info("S3 object already present: s3://%s/%s", bucket, object_key)
-        else:
-            put_mp4_private_then_retry_no_acl(client, bucket, object_key, out_mp4)
-            verify_object_nonzero_after_put(client, bucket, object_key)
-            LOG.info("Uploaded s3://%s/%s", bucket, object_key)
-    except Exception as exc:
-        LOG.exception("S3 failed migration_id=%s", migration_id)
-        if is_s3_auth_or_config_failure(exc):
-            msg = f"S3 authentication or configuration failure: {exc}"
-        else:
-            msg = f"S3 upload/verify failed: {exc}"
-        await _report_safe(
-            session,
-            migration_id=migration_id,
-            outcome="failure",
-            error_message=msg,
-            timeout=timeout,
-        )
-        shutil.rmtree(work_dir, ignore_errors=True)
-        return False
+        try:
+            raw_rep = await _call_report(
+                session,
+                migration_id=migration_id,
+                outcome="success",
+                error_message=None,
+                timeout=timeout,
+            )
+            rep_data = _unwrap_envelope(raw_rep, context="worker/report")
+            LOG.info(
+                "Report success: row_updated=%s merge_status=%s",
+                rep_data.get("row_updated"),
+                rep_data.get("merge_status"),
+            )
+        except Exception as exc:
+            LOG.error(
+                "worker/report failed after successful S3 upload migration_id=%s: %s",
+                migration_id,
+                exc,
+                exc_info=True,
+            )
+            return False
 
-    shutil.rmtree(work_dir, ignore_errors=True)
-
-    try:
-        raw_rep = await _call_report(
-            session,
-            migration_id=migration_id,
-            outcome="success",
-            error_message=None,
-            timeout=timeout,
-        )
-        rep_data = _unwrap_envelope(raw_rep, context="worker/report")
-        LOG.info(
-            "Report success: row_updated=%s merge_status=%s",
-            rep_data.get("row_updated"),
-            rep_data.get("merge_status"),
-        )
-    except Exception as exc:
-        LOG.error(
-            "worker/report failed after successful S3 upload migration_id=%s: %s",
-            migration_id,
-            exc,
-            exc_info=True,
-        )
-        return False
-
-    return True
+        return True
+    finally:
+        if work_dir.is_dir():
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 async def _run_async() -> int:

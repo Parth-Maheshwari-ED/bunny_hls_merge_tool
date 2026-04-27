@@ -317,6 +317,12 @@ async def _attempt_zip_to_mp4(
         raise RuntimeError("Downloaded file is not a valid ZIP archive")
     extract_dir = work_dir / "extracted"
     extract_zip_logged(zip_path, extract_dir)
+    try:
+        n_zip = zip_path.stat().st_size
+        zip_path.unlink()
+        LOG.info("Removed Storage ZIP after extract (%s bytes) to reduce peak disk use", n_zip)
+    except OSError as exc:
+        LOG.warning("Could not remove ZIP after extract (non-fatal): %s", exc)
     best = find_best_video_file_in_tree(extract_dir)
     if best is None:
         raise RuntimeError("No .mp4, .ts, or .m4s files found under extracted ZIP tree")
