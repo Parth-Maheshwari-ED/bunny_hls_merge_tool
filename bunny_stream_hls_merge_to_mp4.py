@@ -373,6 +373,11 @@ def ffmpeg_hls_remux_to_mp4(variant_playlist_url: str, output_mp4: Path) -> None
     Bunny Stream sometimes lists TS segments as ``*.dts``; newer ffmpeg can relax
     extension checks via HLS demuxer options. Older binaries omit those options; we
     probe once and only pass flags this build actually supports.
+
+    When ``-i`` is a **local** ``.m3u8`` (rewritten signed playlist), the HLS demuxer
+    defaults to a tight protocol whitelist (often ``file,crypto,data`` only). Segment
+    lines then use ``https://`` and ffmpeg errors unless ``https`` / ``tcp`` / ``tls``
+    are whitelisted — see ``-protocol_whitelist`` below.
     """
     output_mp4.parent.mkdir(parents=True, exist_ok=True)
     head = [
@@ -381,6 +386,9 @@ def ffmpeg_hls_remux_to_mp4(variant_playlist_url: str, output_mp4: Path) -> None
         "-loglevel",
         "error",
         "-y",
+        # Local playlist + absolute https segment URLs (signed Bunny Storage).
+        "-protocol_whitelist",
+        "file,http,https,tcp,tls,crypto,data",
     ]
     head.extend(_ffmpeg_hls_relaxed_extension_args())
     head.extend(
