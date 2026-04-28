@@ -22,28 +22,37 @@ HTTP: same shape as browser **curl --form** — multipart field ``JSONString``, 
 ``job.s3.bucket`` may be empty; falls back to env ``drm_migration_s3_bucket_name``.
 
 Merge scratch (ZIP extract, ``merged.mp4``) uses the **OS temp directory**, not
-``DRM_MIGRATION_LOCAL_OUTPUT_DIR``. That env path is only for the **no-S3-IAM** fallback
+``DRM_MIGRATION_LOCAL_OUTPUT_DIR``. On merge or upload failure, that scratch directory is
+removed **before** ``worker/report`` so partial ``merged.mp4`` (e.g. after ENOSPC) does not
+keep ``/tmp`` full while reporting or before the next job. A ``finally`` still removes the
+dir after success. **DRM_MIGRATION_LOCAL_OUTPUT_DIR** is only for the **no-S3-IAM** fallback
 (``drm_migration_s3_access_key`` / ``drm_migration_s3_secret_key`` unset): the MP4 is moved
 there and the worker reports failure so the job can be retried after fixing credentials.
 
-Runs in a **loop**: after each job, **POST …/worker/report** (``outcome`` ``success`` or
-``failure`` with ``error_message``), wait **DRM_MIGRATION_JOB_GAP_SEC** (default ``1.5``),
-then **POST …/worker/next** again (after a short pause, default **1.5s**, before each next
-call except the first). Merge, S3, or report errors on one migration do **not**
-stop the worker; only ``worker/next`` transport or envelope errors exit the process.
-Unexpected crashes are still **reported** as ``failure`` when ``migration_id`` is known.
+Runs **N worker slots** (``DRM_MIGRATION_MAX_CONCURRENT_JOBS``, default ``1``). Each slot loops: acquire a shared
+**lock**, **POST …/worker/next** (with **DRM_MIGRATION_JOB_GAP_SEC** before every poll except the process-wide
+first), optional **DRM_MIGRATION_NEXT_POLL_STAGGER_SEC** while still holding the lock, release the lock, then merge
+→ S3 → **POST …/worker/report** in parallel with other slots. **Only one ``worker/next`` runs at a time**, but as
+soon as a slot finishes a video it can take the lock and fetch the next assignment — slots do **not** wait for
+each other. Staggered slot startup (**DRM_MIGRATION_WORKER_START_STAGGER_SEC**, default **5** when N>``1``) spaces
+``create_task``. Each migration uses its own ``tempfile.mkdtemp`` tree so cleanup never touches another slot's
+scratch. Merge, S3, or report errors on one migration do **not** stop the worker; only ``worker/next`` transport or
+envelope errors exit the process. Unexpected crashes are still **reported** as ``failure`` when ``migration_id``
+is known.
 
 **Throughput (why one EC2 does not “use 50 Gbps”)**
 
-- This process does **one** ``worker/next`` job at a time, then merge, then S3, then ``worker/report``.
-  Throughput is the sum of **Bunny → EC2** (ZIP or HLS), **ffmpeg**, and **EC2 → S3**, plus **Edmingle** round-trips.
+- Throughput is the sum of **Bunny → EC2** (ZIP or HLS), **ffmpeg**, and **EC2 → S3**, plus **Edmingle** round-trips.
   Your instance’s “up to N Gbps” NIC does not apply to Bunny’s edge build/ZIP speed or to single-stream ffmpeg.
 - **ZIP:** Bunny builds and streams the archive; downloads in your logs are often **~10–15 MiB/s** — that is
   usually **Bunny or the path to Bunny**, not a broken EC2 NIC.
-- **HLS:** ffmpeg pulls segments **sequentially**; wall time is dominated by remux + network, not local RAM.
-- **Idle gap:** ``DRM_MIGRATION_JOB_GAP_SEC`` (default ``1.5``) sleeps between jobs; set to ``0`` if the API tolerates it.
+- **HLS:** ffmpeg pulls segments **sequentially** per job; wall time is dominated by remux + network, not local RAM.
+- **Parallel jobs:** ``DRM_MIGRATION_MAX_CONCURRENT_JOBS`` (default ``1``). ``DRM_MIGRATION_WORKER_START_STAGGER_SEC`` (default ``5``
+  when N>``1``) spaces slot startup. ``DRM_MIGRATION_NEXT_POLL_STAGGER_SEC`` (default ``0.2`` when N>``1``) sleeps after each new job
+  is granted, still under the fetch lock, before the next ``worker/next``.
+- **Idle gap:** ``DRM_MIGRATION_JOB_GAP_SEC`` (default ``1.5``) sleeps before each ``worker/next``; set to ``0`` if the API tolerates it.
 - **Scale out:** run **multiple** worker processes on **separate** hosts (or one host if Edmingle hands out distinct
-  migration rows per worker without locking); one Python loop will never saturate “50 Gbps”.
+  migration rows per worker without locking).
 - **Tuning:** ``DRM_MIGRATION_ZIP_READ_CHUNK_BYTES``, ``DRM_MIGRATION_S3_UPLOAD_MAX_CONCURRENCY``,
   ``DRM_MIGRATION_S3_MULTIPART_CHUNKSIZE_BYTES`` (see ``bunny_stream_hls_merge_to_mp4`` / ``_drm_migration_s3``).
 """
@@ -57,6 +66,7 @@ import os
 import shutil
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import quote
@@ -92,6 +102,19 @@ def _trunc_err(msg: str) -> str:
     if len(msg) <= ERROR_MSG_MAX:
         return msg
     return msg[: ERROR_MSG_MAX - 40] + "\n...[truncated]"
+
+
+def _remove_job_work_dir(work_dir: Path, migration_id: int, note: str) -> None:
+    """Best-effort delete of this job's scratch only (``work_dir`` is unique per ``_process_migration_job``)."""
+    if not work_dir.is_dir():
+        return
+    shutil.rmtree(work_dir, ignore_errors=True)
+    LOG.info(
+        "Removed job work_dir (%s) migration_id=%s path=%s",
+        note,
+        migration_id,
+        work_dir,
+    )
 
 
 def _api_base() -> str:
@@ -159,6 +182,44 @@ def _job_gap_sec() -> float:
         v = float(raw)
     except ValueError:
         return 1.5
+    return max(0.0, v)
+
+
+def _max_concurrent_migration_jobs() -> int:
+    """Parallel migration workers (async tasks); each may run ffmpeg in the thread pool."""
+    raw = (os.environ.get("DRM_MIGRATION_MAX_CONCURRENT_JOBS") or "1").strip() or "1"
+    try:
+        n = int(raw)
+    except ValueError:
+        return 1
+    return max(1, min(n, 32))
+
+
+def _parallel_slots_enabled(max_slots: int) -> bool:
+    return max_slots > 1
+
+
+def _worker_start_stagger_sec(max_slots: int) -> float:
+    """Delay between ``create_task`` for each slot when parallel (default 5s)."""
+    if not _parallel_slots_enabled(max_slots):
+        return 0.0
+    raw = (os.environ.get("DRM_MIGRATION_WORKER_START_STAGGER_SEC") or "5").strip() or "5"
+    try:
+        v = float(raw)
+    except ValueError:
+        return 5.0
+    return max(0.0, v)
+
+
+def _next_poll_stagger_sec(max_slots: int) -> float:
+    """Sleep after each granted job (under fetch lock) before the next slot may call ``worker/next``."""
+    if not _parallel_slots_enabled(max_slots):
+        return 0.0
+    raw = (os.environ.get("DRM_MIGRATION_NEXT_POLL_STAGGER_SEC") or "0.2").strip() or "0.2"
+    try:
+        v = float(raw)
+    except ValueError:
+        return 0.2
     return max(0.0, v)
 
 
@@ -541,9 +602,9 @@ async def _process_migration_job(
     On any failure, sends ``worker/report`` with ``outcome=failure`` and ``error_message``,
     then returns False.
 
-    The per-job ``work_dir`` under the system temp directory is always removed in a
-    ``finally`` block (merge/HLS/S3/report failures, success, and interrupt) so ZIPs,
-    extracted trees, local HLS playlists, and ``merged.mp4`` do not accumulate on disk.
+    Each call uses a fresh ``tempfile.mkdtemp`` ``work_dir`` (only that path is ever removed for this job).
+    On failure, scratch is removed before ``worker/report``. After **successful S3**, scratch is removed before
+    ``worker/report``; ``finally`` still runs as a no-op if the tree is already gone.
     """
     migration_id = _migration_id(job)
     LOG.info("Picked migration_id=%s", migration_id)
@@ -579,6 +640,7 @@ async def _process_migration_job(
                 )
             if "errno 28" in low or "no space left on device" in low:
                 err += " — Disk full under temp (often /tmp): free space, enlarge volume, or set TMPDIR to a larger mount."
+            _remove_job_work_dir(work_dir, migration_id, "merge failure")
             await _report_safe(
                 session,
                 migration_id=migration_id,
@@ -589,6 +651,7 @@ async def _process_migration_job(
             return False
 
         if not out_mp4.is_file() or out_mp4.stat().st_size <= 0:
+            _remove_job_work_dir(work_dir, migration_id, "empty merge output")
             await _report_safe(
                 session,
                 migration_id=migration_id,
@@ -601,6 +664,7 @@ async def _process_migration_job(
         try:
             bucket, region, object_key = _s3_from_job(job)
         except Exception as exc:
+            _remove_job_work_dir(work_dir, migration_id, "job.s3 parse error")
             await _report_safe(
                 session,
                 migration_id=migration_id,
@@ -615,6 +679,7 @@ async def _process_migration_job(
             local_out.mkdir(parents=True, exist_ok=True)
             dest = local_out / f"{migration_id}_merged.mp4"
             shutil.move(str(out_mp4), str(dest))
+            _remove_job_work_dir(work_dir, migration_id, "LOCAL_OUTPUT_NO_S3 leftover scratch")
             msg = (
                 "LOCAL_OUTPUT_NO_S3: drm_migration_s3_access_key / drm_migration_s3_secret_key "
                 f"not set; MP4 saved at {dest}"
@@ -644,6 +709,7 @@ async def _process_migration_job(
                 msg = f"S3 authentication or configuration failure: {exc}"
             else:
                 msg = f"S3 upload/verify failed: {exc}"
+            _remove_job_work_dir(work_dir, migration_id, "S3 upload/verify failure")
             await _report_safe(
                 session,
                 migration_id=migration_id,
@@ -653,6 +719,7 @@ async def _process_migration_job(
             )
             return False
 
+        _remove_job_work_dir(work_dir, migration_id, "after S3 (tmp freed before worker/report)")
         try:
             raw_rep = await _call_report(
                 session,
@@ -678,8 +745,97 @@ async def _process_migration_job(
 
         return True
     finally:
-        if work_dir.is_dir():
-            shutil.rmtree(work_dir, ignore_errors=True)
+        _remove_job_work_dir(work_dir, migration_id, "job end")
+
+
+async def _consume_one_migration_job_slot(
+    worker_id: int,
+    session: aiohttp.ClientSession,
+    local_out: Path,
+    timeout: aiohttp.ClientTimeout,
+    fail_flag: Dict[str, bool],
+    fetch_lock: asyncio.Lock,
+    poll_state: Dict[str, Any],
+    idle_event: asyncio.Event,
+    fatal_state: Dict[str, int],
+    gap: float,
+    next_poll_stagger: float,
+) -> None:
+    """
+    Repeatedly: under ``fetch_lock`` call ``worker/next`` (serialized), then merge/S3/report **without** the lock
+    so other slots run in parallel. When any slot sees ``has_job=false``, ``idle_event`` stops all slots.
+    """
+    while True:
+        if fatal_state["code"] == 2 or idle_event.is_set():
+            return
+
+        job: Optional[Dict[str, Any]] = None
+        async with fetch_lock:
+            if fatal_state["code"] == 2 or idle_event.is_set():
+                return
+            if poll_state["need_gap_before_next"] and gap > 0:
+                LOG.info("Waiting %.2fs before worker/next", gap)
+                await asyncio.sleep(gap)
+            try:
+                raw_next = await _call_next(session, timeout)
+            except Exception as exc:
+                LOG.error("worker/next request failed: %s", exc, exc_info=True)
+                print(f"FATAL: worker/next failed: {exc}", file=sys.stderr)
+                fatal_state["code"] = 2
+                return
+            poll_state["need_gap_before_next"] = True
+            try:
+                data_next = _unwrap_envelope(raw_next, context="worker/next")
+            except Exception as exc:
+                LOG.error("worker/next bad envelope: %s raw=%s", exc, raw_next)
+                print(f"FATAL: {exc}", file=sys.stderr)
+                fatal_state["code"] = 2
+                return
+            job = _parse_next_job(data_next)
+            if not job:
+                LOG.info("No job (has_job=false). Idle exit.")
+                idle_event.set()
+                return
+            if next_poll_stagger > 0:
+                await asyncio.sleep(next_poll_stagger)
+
+        job_ok = False
+        try:
+            LOG.info(
+                "Worker slot %s starting migration_id=%s",
+                worker_id,
+                _migration_id(job),
+            )
+            job_ok = await _process_migration_job(session, job, local_out, timeout)
+        except Exception as exc:
+            LOG.exception(
+                "Unhandled error while processing job (slot %s, reporting failure)",
+                worker_id,
+            )
+            try:
+                mid = _migration_id(job)
+                await _report_safe(
+                    session,
+                    migration_id=mid,
+                    outcome="failure",
+                    error_message=_trunc_err(str(exc)),
+                    timeout=timeout,
+                )
+            except Exception as report_exc:
+                LOG.error(
+                    "Could not report failure for job (migration_id unknown or report failed): %s",
+                    report_exc,
+                    exc_info=True,
+                )
+            fail_flag["any"] = True
+        else:
+            if not job_ok:
+                fail_flag["any"] = True
+                LOG.info(
+                    "Job finished with failure (slot %s) migration_id=%s",
+                    worker_id,
+                    _migration_id(job),
+                )
 
 
 async def _run_async() -> int:
@@ -701,66 +857,71 @@ async def _run_async() -> int:
         local_out = (d / local_out).resolve()
     # Created on demand when saving MP4 without S3 IAM keys (LOCAL_OUTPUT_NO_S3 path).
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=600)
-    connector = aiohttp.TCPConnector(limit=8)
+    max_slots = _max_concurrent_migration_jobs()
+    connector_limit = max(32, 8 * max_slots)
+    connector = aiohttp.TCPConnector(limit=connector_limit)
     headers = _default_session_headers()
 
-    had_job_failure = False
     gap = _job_gap_sec()
-    first_next = True
+    start_stagger = _worker_start_stagger_sec(max_slots)
+    next_stagger = _next_poll_stagger_sec(max_slots)
+    if max_slots > 1:
+        LOG.info(
+            "Parallel migration mode: DRM_MIGRATION_MAX_CONCURRENT_JOBS=%s connector_limit=%s "
+            "WORKER_START_STAGGER_SEC=%.3f NEXT_POLL_STAGGER_SEC=%.3f (serialized worker/next; parallel merge/S3)",
+            max_slots,
+            connector_limit,
+            start_stagger,
+            next_stagger,
+        )
 
-    async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
-        while True:
-            if not first_next and gap > 0:
-                LOG.info("Waiting %.2fs before worker/next", gap)
-                await asyncio.sleep(gap)
-            first_next = False
+    loop = asyncio.get_running_loop()
+    pool = ThreadPoolExecutor(
+        max_workers=min(128, max(32, 8 * max_slots)),
+        thread_name_prefix="drm_ff",
+    )
+    loop.set_default_executor(pool)
 
-            try:
-                raw_next = await _call_next(session, timeout)
-            except Exception as exc:
-                LOG.error("worker/next request failed: %s", exc, exc_info=True)
-                print(f"FATAL: worker/next failed: {exc}", file=sys.stderr)
-                return 2
+    fail_flag: Dict[str, bool] = {"any": False}
+    fetch_lock = asyncio.Lock()
+    poll_state: Dict[str, Any] = {"need_gap_before_next": False}
+    idle_event = asyncio.Event()
+    fatal_state: Dict[str, int] = {"code": 0}
 
-            try:
-                data_next = _unwrap_envelope(raw_next, context="worker/next")
-            except Exception as exc:
-                LOG.error("worker/next bad envelope: %s raw=%s", exc, raw_next)
-                print(f"FATAL: {exc}", file=sys.stderr)
-                return 2
-
-            job = _parse_next_job(data_next)
-            if not job:
-                LOG.info("No job (has_job=false). Idle exit.")
-                break
-
-            job_ok = False
-            try:
-                job_ok = await _process_migration_job(session, job, local_out, timeout)
-            except Exception as exc:
-                LOG.exception("Unhandled error while processing job (reporting failure)")
-                try:
-                    mid = _migration_id(job)
-                    await _report_safe(
-                        session,
-                        migration_id=mid,
-                        outcome="failure",
-                        error_message=_trunc_err(str(exc)),
-                        timeout=timeout,
+    try:
+        async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+            worker_tasks: list[asyncio.Task[None]] = []
+            for i in range(max_slots):
+                worker_tasks.append(
+                    asyncio.create_task(
+                        _consume_one_migration_job_slot(
+                            i,
+                            session,
+                            local_out,
+                            timeout,
+                            fail_flag,
+                            fetch_lock,
+                            poll_state,
+                            idle_event,
+                            fatal_state,
+                            gap,
+                            next_stagger,
+                        )
                     )
-                except Exception as report_exc:
-                    LOG.error(
-                        "Could not report failure for job (migration_id unknown or report failed): %s",
-                        report_exc,
-                        exc_info=True,
-                    )
-                had_job_failure = True
-            else:
-                if not job_ok:
-                    had_job_failure = True
-                    LOG.info("Job finished with failure; next worker/next after gap.")
+                )
+                if start_stagger > 0 and i + 1 < max_slots:
+                    await asyncio.sleep(start_stagger)
+            results = await asyncio.gather(*worker_tasks, return_exceptions=True)
+            for i, res in enumerate(results):
+                if isinstance(res, BaseException):
+                    LOG.error("Worker slot %s exited with error: %s", i, res, exc_info=res)
+                    fail_flag["any"] = True
+    finally:
+        pool.shutdown(wait=True)
 
-    return 1 if had_job_failure else 0
+    if fatal_state["code"] == 2:
+        return 2
+    return 1 if fail_flag["any"] else 0
 
 
 def main() -> None:
